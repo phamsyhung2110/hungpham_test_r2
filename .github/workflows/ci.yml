@@ -1,0 +1,172 @@
+name: CI Pipeline
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      force_fail:
+        description: "Force integration test failure (proves teardown still runs)"
+        type: boolean
+        default: false
+
+env:
+  IMAGE_NAME: integration-test
+  CLUSTER_NAME: ci-cluster
+
+jobs:
+  # ── Job 1: Fast pre-check ─────────────────────────────────────────────────
+  # Lints the Dockerfile and validates JS syntax before any infra is touched.
+  # Cheap checks gate expensive provisioning.
+  pre-check:
+    name: Pre-Check (Lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+      - name: Validate JS syntax
+        run: node --check src/index.js
+
+  # ── Job 2: Build & package ────────────────────────────────────────────────
+  # Builds the container image with GHA layer cache, then uploads it as an
+  # artifact so the integration-test job can load it into kind.
+  build:
+    name: Build & Package
+    needs: pre-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          # GHA cache: npm ci layer is reused when package*.json is unchanged
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export image tarball
+        run: docker save "${{ env.IMAGE_NAME }}:${{ github.sha }}" | gzip > image.tar.gz
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-image
+          path: image.tar.gz
+          retention-days: 1
+
+  # ── Job 3: Integration test on fresh k8s cluster ─────────────────────────
+  # Creates a kind cluster, deploys PostgreSQL + Redis via Helm, runs the CLI
+  # workload inside the built container, then destroys the cluster — always,
+  # even when the workload exits non-zero.
+  integration-test:
+    name: Integration Test (k8s)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Verify pre-installed tools ───────────────────────────────────────
+      # kind and helm are pre-installed on ubuntu-latest runners
+      - name: Show tool versions
+        run: |
+          kind version
+          helm version --short
+
+      # ── Cluster creation ─────────────────────────────────────────────────
+      - name: Create kind cluster
+        run: |
+          echo "==> Creating kind cluster: ${{ env.CLUSTER_NAME }}"
+          kind create cluster \
+            --name "${{ env.CLUSTER_NAME }}" \
+            --config k8s/kind-config.yaml \
+            --wait 60s
+          echo "==> Cluster ready"
+
+      # ── Load image into cluster ──────────────────────────────────────────
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: container-image
+
+      - name: Load image into kind
+        run: |
+          docker load < image.tar.gz
+          kind load docker-image \
+            "${{ env.IMAGE_NAME }}:${{ github.sha }}" \
+            --name "${{ env.CLUSTER_NAME }}"
+
+      # ── Deploy PostgreSQL + Redis ────────────────────────────────────────
+      - name: Add Bitnami Helm repo
+        run: |
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+          helm repo update
+
+      - name: Deploy PostgreSQL
+        run: |
+          helm install postgres bitnami/postgresql \
+            --set auth.postgresPassword=testpass \
+            --set auth.database=testdb \
+            --set primary.persistence.enabled=false \
+            --wait --timeout 5m
+
+      - name: Deploy Redis
+        run: |
+          helm install redis bitnami/redis \
+            --set auth.enabled=false \
+            --set master.persistence.enabled=false \
+            --wait --timeout 3m
+
+      # ── Port-forward services to runner ─────────────────────────────────
+      - name: Port-forward PostgreSQL and Redis
+        run: |
+          kubectl port-forward svc/postgres-postgresql 5432:5432 &
+          kubectl port-forward svc/redis-master 6379:6379 &
+          echo "Waiting for ports to be ready..."
+          timeout 30 bash -c 'until nc -z localhost 5432; do sleep 1; done'
+          timeout 30 bash -c 'until nc -z localhost 6379; do sleep 1; done'
+          echo "Both services are reachable"
+
+      # ── Run integration test ─────────────────────────────────────────────
+      - name: Run integration test
+        run: |
+          docker run --rm --network host \
+            -e PGHOST=localhost \
+            -e PGPORT=5432 \
+            -e PGUSER=postgres \
+            -e PGPASSWORD=testpass \
+            -e PGDATABASE=testdb \
+            -e REDIS_HOST=localhost \
+            -e REDIS_PORT=6379 \
+            -e FORCE_FAIL=${{ inputs.force_fail || 'false' }} \
+            "${{ env.IMAGE_NAME }}:${{ github.sha }}" 2>&1 | tee test-results.log
+          exit ${PIPESTATUS[0]}
+
+      # ── Publish evidence ─────────────────────────────────────────────────
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.log
+          if-no-files-found: ignore
+
+      # ── Teardown (always runs, even on test failure) ──────────────────────
+      - name: Destroy kind cluster
+        if: always()
+        run: |
+          echo "==> Tearing down kind cluster (runs even on failure)"
+          kind delete cluster --name "${{ env.CLUSTER_NAME }}" || true
+          echo "==> Cluster destroyed"
